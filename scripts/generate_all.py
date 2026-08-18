@@ -13,10 +13,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from terrupt.cli import add_common_args, add_source_args, finalize
+from terrupt.cli import add_common_args, add_source_args, finalize, finalize_stream
 from terrupt.hfexport import export_hf
 from terrupt.sources import load_sentences_cli
-from terrupt.tasks import make_classification, make_punctuation, make_textcorrupt
+from terrupt.tasks import (iter_textcorrupt, make_classification,
+                           make_punctuation)
 
 
 def main():
@@ -47,18 +48,22 @@ def main():
     def run_task(name, build, fields):
         task_out = os.path.join(jsonl_root, name)
         os.makedirs(task_out, exist_ok=True)
-        records = build()
         task_args = argparse.Namespace(**vars(args))
         task_args.out = task_out
-        stats = finalize(records, task_args, name, fields)
+        records = build()
+        if name == "textcorrupt":
+            stats = finalize_stream(records, task_args, name, fields,
+                                    args.count or len(sentences))
+        else:
+            stats = finalize(records, task_args, name, fields)
         print(f"{name}: {stats['count']} records -> {task_out}")
         return task_out, stats
 
     rng = random.Random(args.seed)
     tc_dir, _ = run_task(
         "textcorrupt",
-        lambda: make_textcorrupt(sentences, severities, rng, args.language,
-                                 args.count, workers=args.workers),
+         lambda: iter_textcorrupt(sentences, severities, rng, args.language,
+                                  args.count, workers=args.workers),
         ["corruption_type", "severity", "op_count", "language", "source"])
 
     rng = random.Random(args.seed + 1)

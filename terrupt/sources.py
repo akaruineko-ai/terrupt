@@ -199,7 +199,7 @@ def _collect(spec, per_source, wikipedia_config, desc="loading", progress=True,
     decode and the pure-Python regex work). Otherwise a serial streaming path
     is used (gated sources, ``workers == 1``, or no network).
     """
-    workers = workers or os.cpu_count() or 1
+    workers = workers or min(os.cpu_count() or 1, 8)
     workers = max(1, int(workers))
     clean = spec["clean"]
     column = spec["column"]

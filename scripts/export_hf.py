@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from terrupt.engine import OP_DESCRIPTIONS, SEVERITY_SCALE
 from terrupt.hfcard import build_meta
-from terrupt.hfexport import export_hf
+from terrupt.hfexport import export_hf, export_hf_stream
 from terrupt.sources import SOURCES, SOURCE_NAMES
 
 
@@ -45,6 +45,10 @@ def main():
     parser.add_argument("--modes", type=str, default="strip,wrong,random,spacing")
     parser.add_argument("--severities", type=str, default="0.1,0.25,0.5,0.75,1.0")
     parser.add_argument("--include-clean", action="store_true")
+    parser.add_argument("--stream", action="store_true",
+                        help="stream JSONL row-by-row (memory-safe, recommended for >1M rows)")
+    parser.add_argument("--max-shard-size", type=str, default="2GB",
+                        help="max arrow shard size (default: 2GB)")
     parser.add_argument("--version", type=str, default="0.1.0")
     args = parser.parse_args()
 
@@ -86,7 +90,11 @@ def main():
     meta = build_meta(meta_args, stats, None, source_meta,
                       [{"name": n, "description": d} for n, d in OP_DESCRIPTIONS.items()],
                       _example(task), args.language)
-    export_hf(args.input_dir, args.out, meta)
+    if args.stream:
+        export_hf_stream(args.input_dir, args.out, meta,
+                         max_shard_size=args.max_shard_size)
+    else:
+        export_hf(args.input_dir, args.out, meta)
     print(f"exported {args.name} ({task}) -> {args.out}")
 
 

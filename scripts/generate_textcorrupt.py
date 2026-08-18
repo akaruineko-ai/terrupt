@@ -7,9 +7,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from terrupt.cli import add_common_args, add_source_args, finalize
+from terrupt.cli import add_common_args, add_source_args, finalize_stream
 from terrupt.sources import SOURCES, load_sentences_cli
-from terrupt.tasks import make_textcorrupt
+from terrupt.tasks import iter_textcorrupt
 
 
 def main():
@@ -27,10 +27,14 @@ def main():
         sources, args.corpus, args.language, args.per_source,
         args.wikipedia_config, args.seed, workers=args.workers)
     rng = random.Random(args.seed)
-    records = make_textcorrupt(sentences, severities, rng, args.language, args.count,
-                               workers=args.workers)
-    stats = finalize(records, args, "textcorrupt",
-                     ["corruption_type", "severity", "op_count", "language", "source"])
+    total = args.count or len(sentences)
+    stats = finalize_stream(
+        iter_textcorrupt(sentences, severities, rng, args.language, total,
+                         workers=args.workers),
+        args, "textcorrupt",
+        ["corruption_type", "severity", "op_count", "language", "source"],
+        total,
+    )
     print(f"generated {stats['count']} textcorrupt records -> {args.out}")
     print(f"  corpus sentences: {len(sentences)}")
     for key, info in breakdown.items():

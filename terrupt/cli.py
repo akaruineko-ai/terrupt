@@ -122,3 +122,54 @@ def finalize(records, args, prefix, summary_fields):
     import gc
     gc.collect()
     return stats
+
+
+def finalize_stream(records, args, prefix, summary_fields, total):
+    """Write a known-size record iterator without retaining all records."""
+    os.makedirs(args.out, exist_ok=True)
+    splits = parse_splits(args.splits)
+    raw = {name: total * splits[name] for name in splits}
+    counts = {name: math.floor(value) for name, value in raw.items()}
+    remainder = total - sum(counts.values())
+    order = sorted(splits, key=lambda name: raw[name] - counts[name], reverse=True)
+    for name in order[:remainder]:
+        counts[name] += 1
+    prefix = prefix or os.path.basename(args.out.rstrip("/"))
+    handles = {}
+    stats = {"count": 0}
+    field_counts = {field: {} for field in summary_fields}
+    split_seen = {name: 0 for name in splits}
+    boundaries = []
+    end = 0
+    for name in splits:
+        end += counts[name]
+        boundaries.append((end, name))
+
+    def path_for(name, index):
+        if args.shards <= 1:
+            return os.path.join(args.out, f"{prefix}_{name}.jsonl")
+        size = math.ceil(counts[name] / args.shards)
+        return os.path.join(args.out, f"{prefix}_{name}_{index // size:02d}.jsonl")
+
+    try:
+        for index, record in enumerate(records):
+            for boundary, name in boundaries:
+                if index < boundary:
+                    break
+            local_index = split_seen[name]
+            split_seen[name] += 1
+            path = path_for(name, local_index)
+            if path not in handles:
+                handles[path] = open(path, "w", encoding="utf-8")
+            handles[path].write(json.dumps(record, ensure_ascii=False) + "\n")
+            stats["count"] += 1
+            for field in summary_fields:
+                key = str(record.get(field))
+                field_counts[field][key] = field_counts[field].get(key, 0) + 1
+    finally:
+        for handle in handles.values():
+            handle.close()
+    stats.update(field_counts)
+    stats["splits"] = split_seen
+    write_stats(os.path.join(args.out, "stats.json"), stats)
+    return stats
