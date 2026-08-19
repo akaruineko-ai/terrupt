@@ -391,7 +391,7 @@ def build_quality_subset(val_full, tokenizer, per_severity_n=1000, seed=42,
 
     subset = subset.map(
         preprocess, batched=True, batch_size=512, num_proc=n_proc,
-        cache_file_names={f"proc{i}": cf for i, cf in enumerate(cache_files)} if cache_files else None,
+        cache_file_name=cache_files if cache_files else None,
     )
     print(f"Quality subset: {len(subset)} rows (per-sev: {per_severity_n})")
     return subset, severity_list
@@ -429,7 +429,7 @@ def tokenize_dataset(dataset, tokenizer, max_length=64, n_proc=1,
         batch_size=512,
         num_proc=n_proc,
         load_from_cache_file=load_cache if cache_file_prefix else True,
-        cache_file_names={f"proc{i}": cf for i, cf in enumerate(cache_files)} if cache_files else None,
+        cache_file_name=cache_files if cache_files else None,
     )
 
 
