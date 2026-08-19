@@ -37,7 +37,7 @@ python3 -c "
 import torch
 if torch.cuda.is_available():
     name = torch.cuda.get_device_name(0)
-    vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
     cc = torch.cuda.get_device_capability(0)
     bf16 = 'yes' if cc[0] >= 8 else 'no (use fp16)'
     print(f'GPU: {name}  VRAM: {vram:.0f}GB  bf16: {bf16}')

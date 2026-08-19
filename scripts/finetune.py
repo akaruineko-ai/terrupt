@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
-from datasets import load_from_disk, load_dataset
+from datasets import DatasetDict, load_dataset_builder, load_from_disk, load_dataset
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSeq2SeqLM,
@@ -303,7 +303,8 @@ def load_data(data_path):
     if os.path.isdir(data_path):
         return load_from_disk(data_path)
     print(f"Loading dataset from HuggingFace Hub: {data_path}")
-    ds = load_dataset(data_path)
+    splits = [s.name for s in load_dataset_builder(data_path).info.splits]
+    ds = DatasetDict({s: load_dataset(data_path, split=s) for s in splits})
     if "train" not in ds:
         key = list(ds.keys())[0]
         ds = ds.rename_column(key, "train") if key != "train" else ds
