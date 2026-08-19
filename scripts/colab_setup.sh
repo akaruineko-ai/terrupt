@@ -17,10 +17,19 @@ if ! command -v hf &>/dev/null; then
 fi
 echo "hf CLI: $(hf --version 2>/dev/null || echo 'installed')"
 
-# --- Python deps ---
+# --- Python deps (torch handled separately: keep Colab's CUDA build) ---
 echo "Installing Python dependencies..."
 pip install -q --upgrade pip
-pip install -q sentencepiece sacrebleu peft accelerate datasets transformers torch
+pip install -q sentencepiece sacrebleu peft accelerate datasets transformers
+
+# --- Torch: never force-overwrite an existing CUDA-enabled build ---
+if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+    echo "torch: $(python3 -c "import torch; print(torch.__version__)") (CUDA OK, keeping existing build)"
+else
+    echo "torch: CUDA not available — installing CUDA build from PyTorch index"
+    CUDA_TAG="${TORCH_CUDA_INDEX_TAG:-cu124}"
+    pip install -q --upgrade torch --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+fi
 
 # --- Auth (optional, needed for private repos / bucket sync) ---
 if [ -n "${HF_TOKEN:-}" ]; then
@@ -35,14 +44,17 @@ fi
 # --- Check GPU ---
 python3 -c "
 import torch
-if torch.cuda.is_available():
-    name = torch.cuda.get_device_name(0)
-    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-    cc = torch.cuda.get_device_capability(0)
-    bf16 = 'yes' if cc[0] >= 8 else 'no (use fp16)'
-    print(f'GPU: {name}  VRAM: {vram:.0f}GB  bf16: {bf16}')
-else:
-    print('WARNING: No GPU detected!')
+if not torch.cuda.is_available():
+    print('WARNING: torch.cuda.is_available() is False!')
+    print(f'  torch: {torch.__version__}')
+    print('  This is a CPU-only / misbuilt torch. Fix:')
+    print('  pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu124')
+    raise SystemExit(1)
+name = torch.cuda.get_device_name(0)
+vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+cc = torch.cuda.get_device_capability(0)
+bf16 = 'yes' if cc[0] >= 8 else 'no (use fp16)'
+print(f'GPU: {name}  VRAM: {vram:.0f}GB  bf16: {bf16}')
 "
 
 echo ""
