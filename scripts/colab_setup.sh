@@ -22,13 +22,27 @@ echo "Installing Python dependencies..."
 pip install -q --upgrade pip
 pip install -q sentencepiece sacrebleu peft accelerate datasets transformers
 
-# --- Torch: never force-overwrite an existing CUDA-enabled build ---
+# --- Torch: keep/restore a CUDA-enabled build ---
+TORCH_CUDA_TAG="${TORCH_CUDA_INDEX_TAG:-cu124}"
+TORCH_IS_CPU=$(python3 -c "import torch; print('no' if getattr(torch, 'version', None).cuda else 'yes')" 2>/dev/null || echo "unknown")
 if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     echo "torch: $(python3 -c "import torch; print(torch.__version__)") (CUDA OK, keeping existing build)"
+elif [ "$TORCH_IS_CPU" = "yes" ]; then
+    echo "torch: CPU-only build detected — installing CUDA build from PyTorch index"
+    pip install -q --force-reinstall --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}" torch
 else
-    echo "torch: CUDA not available — installing CUDA build from PyTorch index"
-    CUDA_TAG="${TORCH_CUDA_INDEX_TAG:-cu124}"
-    pip install -q --upgrade torch --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+    echo "torch: $(python3 -c "import torch; print(torch.__version__)") has CUDA compiled but"
+    echo "       torch.cuda.is_available() is False — driver/runtime problem, not a CPU build."
+    if command -v nvidia-smi &>/dev/null; then
+        echo "  nvidia-smi:"
+        nvidia-smi 2>&1 | head -8 || true
+    else
+        echo "  nvidia-smi: NOT FOUND — NVIDIA driver is not installed/loaded in this session."
+    fi
+    echo "  This usually means the Colab runtime has no GPU attached."
+    echo "  Fix: Runtime > Change runtime type > T4 GPU (or A100), then re-run this script."
+    echo "  If the driver IS present, force a matching torch build with:"
+    echo "    pip install --force-reinstall --index-url https://download.pytorch.org/whl/${TORCH_CUDA_TAG} torch"
 fi
 
 # --- Auth (optional, needed for private repos / bucket sync) ---
@@ -47,8 +61,13 @@ import torch
 if not torch.cuda.is_available():
     print('WARNING: torch.cuda.is_available() is False!')
     print(f'  torch: {torch.__version__}')
-    print('  This is a CPU-only / misbuilt torch. Fix:')
-    print('  pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu124')
+    if torch.version.cuda:
+        print('  Build has CUDA compiled in, but the driver/runtime is not usable.')
+        print('  Check nvidia-smi above. Likely no GPU attached to this runtime,')
+        print('  or a driver/torch mismatch.')
+    else:
+        print('  This is a CPU-only torch build.')
+    print('  Fix: Runtime > Change runtime type > GPU, then re-run this script.')
     raise SystemExit(1)
 name = torch.cuda.get_device_name(0)
 vram = torch.cuda.get_device_properties(0).total_memory / 1e9
