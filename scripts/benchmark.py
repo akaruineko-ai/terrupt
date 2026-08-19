@@ -86,7 +86,6 @@ def main():
     print(f"Loading tokenizer and model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model)
-    model.gradient_checkpointing_enable()
 
     print(f"Building 10k-row dataset from {args.data}...")
     train_ds = build_dataset(args.data, tokenizer, n_rows=10_000)

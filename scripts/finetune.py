@@ -491,6 +491,14 @@ def main():
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.1)
 
+    # Memory / speed
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (saves VRAM, slower; "
+                             "only needed for large models that don't fit)")
+    parser.add_argument("--torch-compile", action="store_true",
+                        help="Compile the model with torch.compile (A100/Ampere+; "
+                             "first steps are slow, then big speedup)")
+
     # Tokenization cache
     parser.add_argument("--force-retokenize", action="store_true",
                         help="Ignore tokenization cache and recompute")
@@ -531,7 +539,12 @@ def main():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    model.gradient_checkpointing_enable()
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    if args.torch_compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # -----------------------------------------------------------------------
     # Data
@@ -679,7 +692,18 @@ def main():
           f"beams={args.eval_num_beams}")
     print(f"  Full eval at end: {'yes' if args.full_eval_at_end else 'no'}")
     print(f"  LoRA:             {'yes' if args.lora else 'no'}")
+    print(f"  Gradient ckpt:    {'yes (slower)' if args.gradient_checkpointing else 'no (faster)'}")
+    print(f"  torch.compile:    {'yes' if args.torch_compile else 'no'}")
     print(f"  Output:           {args.out}")
+
+    # Wall-clock estimate (very rough; real throughput varies a lot by GPU,
+    # data loading, and whether torch.compile is used)
+    base_sps = 60.0 if torch.cuda.is_available() else 12.0
+    est_hours = len(train_ds) * args.epochs / base_sps / 3600
+    print(f"  ~Expected time:  {est_hours:.1f}h (rough estimate at {base_sps:.0f} samples/s)")
+    if est_hours > 12:
+        print("  NOTE: this is a long run. Consider --epochs 1 and/or a larger")
+        print("        --batch-size/--grad-accum to reduce step count.")
     if args.hf_bucket:
         print(f"  HF bucket:        {args.hf_bucket}")
     print()
