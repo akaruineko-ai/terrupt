@@ -307,6 +307,9 @@ def load_data(data_path):
     if "train" not in ds:
         key = list(ds.keys())[0]
         ds = ds.rename_column(key, "train") if key != "train" else ds
+    if "val" not in ds and "validation" in ds:
+        ds["val"] = ds["validation"]
+        del ds["validation"]
     return ds
 
 
