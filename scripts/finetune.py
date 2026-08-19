@@ -593,13 +593,16 @@ def main():
     has_storage_limit = args.limit_checkpoints_folder is not None
     storage_limit_bytes = parse_size(args.limit_checkpoints_folder) if has_storage_limit else None
 
+    total_steps = int(np.ceil(len(train_ds) / effective_batch)) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+
     training_kwargs = dict(
         output_dir=args.out,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         logging_steps=50,
         eval_strategy="epoch",
@@ -609,7 +612,6 @@ def main():
         metric_for_best_model="eval_loss",
         report_to="none",
         dataloader_num_workers=min(n_proc, 8),
-        predict_with_generate=False,
         seed=args.seed,
     )
     if save_steps is not None:
@@ -627,7 +629,7 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     # -----------------------------------------------------------------------

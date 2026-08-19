@@ -119,7 +119,7 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     print(f"Running {args.steps} steps (batch {args.batch_size} x grad_accum {args.grad_accum}, precision {precision})...")
