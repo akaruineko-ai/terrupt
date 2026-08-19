@@ -1,30 +1,36 @@
-"""Fine-tune T5-small on terrupt-textcorrupt (corrupted -> original).
+"""Fine-tune T5 on terrupt-textcorrupt (corrupted -> original).
 
 Loads the paired dataset from local disk or HuggingFace Hub, builds a
 hard-weighted subsample (or uses all 29M rows), tokenizes, and trains
-with the HuggingFace Seq2SeqTrainer. Supports LoRA and HF bucket sync.
+with the HuggingFace Seq2SeqTrainer. Supports LoRA, HF bucket sync,
+and configurable checkpoint frequency with storage-limit pruning.
 
 Usage:
     # Local 1660 Ti (5M hard-weighted, ~5-20h)
     python scripts/finetune.py --data data/terrupt-textcorrupt
 
-    # Full 29M on A100 (1 epoch, ~1.5h)
+    # Full 29M on A100 (1 epoch, ~1.5h), save every 5k steps
     python scripts/finetune.py --data akaruineko/terrupt-textcorrupt \
-        --target-rows -1 --epochs 1 --precision bf16
+        --target-rows -1 --epochs 1 --precision bf16 \
+        --save-steps 5000
 
-    # Colab with HF bucket checkpoint sync
+    # Colab with HF bucket sync + 50GB local+remote checkpoint cap
     python scripts/finetune.py --data akaruineko/terrupt-textcorrupt \
         --target-rows -1 --precision bf16 \
-        --hf-bucket hf://buckets/akaruineko/restratext
+        --hf-bucket hf://buckets/akaruineko/restratext \
+        --limit-checkpoints-folder 50gb
 
-    # LoRA on T5-large
+    # LoRA on T5-large with 20GB checkpoint cap
     python scripts/finetune.py --model t5-large --lora --lora-r 16 \
-        --lora-alpha 32 --target-rows -1 --precision bf16
+        --lora-alpha 32 --target-rows -1 --precision bf16 \
+        --limit-checkpoints-folder 20gb
 """
 
 import argparse
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -45,16 +51,78 @@ from transformers import (
 
 
 # ---------------------------------------------------------------------------
+# Size helpers
+# ---------------------------------------------------------------------------
+
+_SIZE_RE = re.compile(r"^([\d.]+)\s*(b|kb|mb|gb|tb|k|m|g|t)?$", re.IGNORECASE)
+_UNITS = {
+    "b": 1, "k": 1 << 10, "kb": 1 << 10,
+    "m": 1 << 20, "mb": 1 << 20,
+    "g": 1 << 30, "gb": 1 << 30,
+    "t": 1 << 40, "tb": 1 << 40,
+}
+
+
+def parse_size(s):
+    """Parse human-readable size string ('50gb', '2.5tb', '100mb', '4096') to bytes."""
+    m = _SIZE_RE.match(s.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid size '{s}': use format like '50gb', '2.5tb', '100mb', or bytes"
+        )
+    value = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    return int(value * _UNITS[unit])
+
+
+def dir_size(path):
+    """Recursive total file size of a directory in bytes."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _checkpoint_step(name):
+    """Extract numeric step from 'checkpoint-1234' directory name."""
+    m = re.search(r"checkpoint-(\d+)$", name)
+    return int(m.group(1)) if m else -1
+
+
+def checkpoint_dirs(output_dir):
+    """Return checkpoint directory names sorted by step (oldest first)."""
+    dirs = []
+    if not os.path.isdir(output_dir):
+        return dirs
+    for name in os.listdir(output_dir):
+        if name.startswith("checkpoint-") and os.path.isdir(
+            os.path.join(output_dir, name)
+        ):
+            dirs.append(name)
+    dirs.sort(key=_checkpoint_step)
+    return dirs
+
+
+# ---------------------------------------------------------------------------
 # HF bucket sync
 # ---------------------------------------------------------------------------
 
-def sync_to_hf_bucket(local_dir, bucket_url):
-    """Sync a local directory to an HF bucket via ``hf sync``."""
+def sync_to_hf_bucket(local_dir, bucket_url, delete_remote=False):
+    """Sync a local directory to an HF bucket via ``hf sync``.
+
+    When *delete_remote* is True, passes ``--delete`` so the bucket
+    mirrors exactly what's in *local_dir* (pruned checkpoints removed).
+    """
+    cmd = ["hf", "sync"]
+    if delete_remote:
+        cmd.append("--delete")
+    cmd.extend([local_dir, bucket_url])
     try:
-        subprocess.run(
-            ["hf", "sync", local_dir, bucket_url],
-            check=True, capture_output=True, text=True,
-        )
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
         print(f"  Synced {local_dir} -> {bucket_url}")
     except FileNotFoundError:
         print("  Warning: 'hf' CLI not found, skipping bucket sync")
@@ -65,12 +133,65 @@ def sync_to_hf_bucket(local_dir, bucket_url):
 class HFSyncCallback(TrainerCallback):
     """Sync checkpoint dir to HF bucket after every save."""
 
-    def __init__(self, bucket_url, local_dir):
+    def __init__(self, bucket_url, local_dir, delete_remote=False):
         self.bucket_url = bucket_url
         self.local_dir = local_dir
+        self.delete_remote = delete_remote
 
     def on_save(self, args, state, control, **kwargs):
-        sync_to_hf_bucket(self.local_dir, self.bucket_url)
+        sync_to_hf_bucket(self.local_dir, self.bucket_url, self.delete_remote)
+
+
+# ---------------------------------------------------------------------------
+# Storage-limit callback
+# ---------------------------------------------------------------------------
+
+class StorageLimitCallback(TrainerCallback):
+    """Delete oldest checkpoint-* dirs when output_dir exceeds a byte-size cap.
+
+    Always protects:
+      - The just-saved checkpoint (``checkpoint-{state.global_step}``)
+      - The best checkpoint (``state.best_model_checkpoint``)
+    """
+
+    def __init__(self, output_dir, limit_bytes):
+        self.output_dir = output_dir
+        self.limit_bytes = limit_bytes
+
+    def on_save(self, args, state, control, **kwargs):
+        limit = self.limit_bytes
+
+        # Determine protected checkpoints (never delete these)
+        protected = set()
+        if state.best_model_checkpoint:
+            protected.add(os.path.basename(state.best_model_checkpoint))
+        latest = f"checkpoint-{state.global_step}"
+        protected.add(latest)
+
+        total = dir_size(self.output_dir)
+        if total <= limit:
+            return
+
+        print(f"\n  [storage-limit] checkpoint dir = {total / (1 << 30):.1f} GB "
+              f"> {limit / (1 << 30):.1f} GB limit — pruning old checkpoints")
+
+        while total > limit:
+            oldest = next(
+                (d for d in checkpoint_dirs(self.output_dir) if d not in protected),
+                None,
+            )
+            if oldest is None:
+                print(f"  [storage-limit] cannot prune further: only protected "
+                      f"checkpoints remain ({total / (1 << 30):.1f} GB)")
+                break
+            target = os.path.join(self.output_dir, oldest)
+            freed = dir_size(target)
+            shutil.rmtree(target, ignore_errors=True)
+            total -= freed
+            print(f"  [storage-limit] deleted {oldest} (freed {freed / (1 << 30):.1f} GB, "
+                  f"now {total / (1 << 30):.1f} GB)")
+
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +344,14 @@ def main():
     parser.add_argument("--precision", type=str, default="auto",
                         choices=["auto", "fp16", "bf16", "fp32"])
 
+    # Checkpoint control
+    parser.add_argument("--save-steps", type=int, default=None,
+                        help="Save checkpoint every N steps (default: save per epoch)")
+    parser.add_argument("--limit-checkpoints-folder", type=str, default=None,
+                        help="Max local+remote checkpoint storage (e.g. '50gb', '200mb'). "
+                             "Oldest checkpoints are deleted when exceeded. Also enforced "
+                             "on HF bucket when --hf-bucket is set.")
+
     # LoRA
     parser.add_argument("--lora", action="store_true",
                         help="Enable LoRA adapter (requires peft)")
@@ -316,6 +445,22 @@ def main():
     effective_batch = args.batch_size * args.grad_accum
     precision = resolve_precision(args.precision)
 
+    # Checkpoint strategy: steps vs epoch
+    if args.save_steps is not None:
+        save_strategy = "steps"
+        save_steps = args.save_steps
+    else:
+        save_strategy = "epoch"
+        save_steps = None
+
+    # When a storage limit is set, disable Trainer's count-based pruning
+    # so our size-based callback governs exclusively.
+    has_storage_limit = args.limit_checkpoints_folder is not None
+    if has_storage_limit:
+        storage_limit_bytes = parse_size(args.limit_checkpoints_folder)
+    else:
+        storage_limit_bytes = None
+
     training_kwargs = dict(
         output_dir=args.out,
         num_train_epochs=args.epochs,
@@ -326,8 +471,8 @@ def main():
         lr_scheduler_type="cosine",
         logging_steps=50,
         eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=1,
+        save_strategy=save_strategy,
+        save_total_limit=1 if not has_storage_limit else None,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         report_to="none",
@@ -335,11 +480,12 @@ def main():
         predict_with_generate=False,
         seed=args.seed,
     )
+    if save_steps is not None:
+        training_kwargs["save_steps"] = save_steps
     if precision == "fp16":
         training_kwargs["fp16"] = True
     elif precision == "bf16":
         training_kwargs["bf16"] = True
-    # fp32: no flag needed (default)
 
     training_args = Seq2SeqTrainingArguments(**training_kwargs)
 
@@ -352,10 +498,23 @@ def main():
         tokenizer=tokenizer,
     )
 
-    # HF bucket sync callback
+    # -----------------------------------------------------------------------
+    # Callbacks: storage limit + HF bucket sync
+    # -----------------------------------------------------------------------
+    # Storage limit callback (runs first — prunes oldest local checkpoints)
+    if has_storage_limit:
+        print(f"Storage limit: {args.limit_checkpoints_folder} "
+              f"({storage_limit_bytes:,} bytes)")
+        trainer.add_callback(
+            StorageLimitCallback(args.out, storage_limit_bytes)
+        )
+
+    # HF bucket sync (runs after pruning — with --delete to mirror local state)
     if args.hf_bucket:
-        print(f"Checkpoint sync enabled: {args.hf_bucket}")
-        trainer.add_callback(HFSyncCallback(args.hf_bucket, args.out))
+        print(f"Checkpoint sync: {args.hf_bucket}")
+        trainer.add_callback(
+            HFSyncCallback(args.hf_bucket, args.out, delete_remote=has_storage_limit)
+        )
 
     # -----------------------------------------------------------------------
     # Train
@@ -368,6 +527,9 @@ def main():
     print(f"  Effective batch:{effective_batch}")
     print(f"  LR:             {args.lr}")
     print(f"  Precision:      {precision}")
+    print(f"  Save strategy:  {save_strategy}"
+          + (f" every {save_steps} steps" if save_steps else ""))
+    print(f"  Storage limit:  {args.limit_checkpoints_folder or 'none'}")
     print(f"  LoRA:           {'yes' if args.lora else 'no'}")
     print(f"  Output:         {args.out}")
     if args.hf_bucket:
@@ -391,7 +553,7 @@ def main():
     tokenizer.save_pretrained(args.out)
 
     if args.hf_bucket:
-        sync_to_hf_bucket(args.out, args.hf_bucket)
+        sync_to_hf_bucket(args.out, args.hf_bucket, delete_remote=has_storage_limit)
 
     print("Done.")
 
