@@ -587,8 +587,10 @@ def main():
 
     if args.save_steps is not None:
         save_strategy, save_steps = "steps", args.save_steps
+        eval_strategy, eval_steps = "steps", args.save_steps
     else:
         save_strategy, save_steps = "epoch", None
+        eval_strategy, eval_steps = "epoch", None
 
     has_storage_limit = args.limit_checkpoints_folder is not None
     storage_limit_bytes = parse_size(args.limit_checkpoints_folder) if has_storage_limit else None
@@ -605,7 +607,7 @@ def main():
         warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         logging_steps=50,
-        eval_strategy="epoch",
+        eval_strategy=eval_strategy,
         save_strategy=save_strategy,
         save_total_limit=1 if not has_storage_limit else None,
         load_best_model_at_end=True,
@@ -616,6 +618,7 @@ def main():
     )
     if save_steps is not None:
         training_kwargs["save_steps"] = save_steps
+        training_kwargs["eval_steps"] = eval_steps
     if precision == "fp16":
         training_kwargs["fp16"] = True
     elif precision == "bf16":
