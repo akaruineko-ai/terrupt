@@ -1,7 +1,8 @@
 """Evaluate a fine-tuned model on terrupt-textcorrupt.
 
 Loads a trained checkpoint and evaluates on a val subsample with
-exact-match (normalized) + chrF, broken down per severity and corruption type.
+exact-match (normalized) + chrF, broken down per severity, corruption
+type, and source.
 
 Usage:
     # Local
@@ -14,11 +15,13 @@ Usage:
     # From HF bucket checkpoint
     python scripts/eval.py --model hf://buckets/akaruineko/restratext/checkpoint-1234 \
         --precision bf16
+
+    # Full 1.62M val (expensive ~15-45 min on A100)
+    python scripts/eval.py --model models/terrupt-t5-small --n-rows 1623670
 """
 
 import argparse
 import os
-import re
 import sys
 import tempfile
 import subprocess
@@ -27,26 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
-from collections import defaultdict
 from datasets import load_from_disk, load_dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from sacrebleu.metrics import CHRF
 
-
-def normalize(text):
-    """Lowercase, strip, collapse whitespace."""
-    text = text.lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def exact_match(pred, ref):
-    return int(normalize(pred) == normalize(ref))
-
-
-def chrf_score(preds, refs):
-    chrf = CHRF(word_order=2)
-    return chrf.corpus_score(preds, [refs])
+from terrupt.metrics import exact_match, build_quality_report, print_quality_report
 
 
 def resolve_precision(precision_str):
@@ -62,7 +49,6 @@ def load_data(data_path):
     if os.path.isdir(data_path):
         return load_from_disk(data_path)["val"]
     if os.path.isfile(data_path):
-        # Could be a local checkpoint dir — try loading as dataset
         raise ValueError(f"Expected a directory, got file: {data_path}")
     print(f"Loading val split from HuggingFace Hub: {data_path}")
     return load_dataset(data_path, split="val")
@@ -70,7 +56,6 @@ def load_data(data_path):
 
 def load_model_from_path(model_path, precision):
     """Load model from local path, HF Hub ID, or HF bucket URL."""
-    # HF bucket URL: download via hf CLI
     if model_path.startswith("hf://"):
         tmp_dir = tempfile.mkdtemp(prefix="terrupt_ckpt_")
         print(f"Downloading checkpoint from {model_path} to {tmp_dir}...")
@@ -96,6 +81,7 @@ def main():
                         help="Local path or HF Hub repo ID")
     parser.add_argument("--n-rows", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-beams", type=int, default=4)
     parser.add_argument("--precision", type=str, default="auto",
                         choices=["auto", "fp16", "bf16", "fp32"])
     parser.add_argument("--seed", type=int, default=42)
@@ -115,7 +101,7 @@ def main():
     idx = rng.choice(len(val_full), n, replace=False)
     val_ds = val_full.select(idx.tolist())
 
-    print(f"Running inference on {n} rows...")
+    print(f"Running inference on {n} rows (beams={args.num_beams})...")
     preds = []
     refs = []
     severities = []
@@ -137,7 +123,7 @@ def main():
         with torch.no_grad():
             out = model.generate(
                 **enc, max_length=args.max_length,
-                num_beams=4, early_stopping=True
+                num_beams=args.num_beams, early_stopping=True
             )
 
         decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
@@ -148,69 +134,29 @@ def main():
         sources.extend([b["source"] for b in batch])
 
         if (start // args.batch_size) % 5 == 0:
-            print(f"  {start + args.batch_size}/{n} done")
+            print(f"  {min(start + args.batch_size, n)}/{n} done")
 
-    # Overall metrics
-    em_scores = [exact_match(p, r) for p, r in zip(preds, refs)]
-    overall_em = sum(em_scores) / len(em_scores)
-    overall_chrf = chrf_score(preds, refs).score
-
+    # Build and print report
     print("\n" + "=" * 60)
-    print("OVERALL RESULTS")
-    print("=" * 60)
-    print(f"Exact match (normalized): {overall_em:.4f} ({overall_em*100:.1f}%)")
-    print(f"chrF++ (word_order=2):    {overall_chrf:.2f}")
-    print(f"Total samples: {len(preds)}")
-    print()
+    report = build_quality_report(preds, refs, severities=severities,
+                                  corruption_types=corruption_types)
+    print_quality_report(report, title="eval results", severity_key="severity")
 
-    # Per-severity breakdown
-    print("-" * 60)
-    print("PER SEVERITY")
-    print("-" * 60)
-    sev_groups = defaultdict(lambda: {"preds": [], "refs": []})
-    for i in range(len(preds)):
-        sev_groups[severities[i]]["preds"].append(preds[i])
-        sev_groups[severities[i]]["refs"].append(refs[i])
-
-    for sev in sorted(sev_groups):
-        g = sev_groups[sev]
-        em = sum(exact_match(p, r) for p, r in zip(g["preds"], g["refs"])) / len(g["preds"])
-        ch = chrf_score(g["preds"], g["refs"]).score
-        print(f"  severity {sev:<4}: EM={em:.4f} ({em*100:.1f}%)  chrF={ch:.2f}  n={len(g['preds'])}")
-
-    # Per-corruption-type breakdown
-    print()
-    print("-" * 60)
-    print("PER CORRUPTION TYPE")
-    print("-" * 60)
-    ct_groups = defaultdict(lambda: {"preds": [], "refs": []})
-    for i in range(len(preds)):
-        ct_groups[corruption_types[i]]["preds"].append(preds[i])
-        ct_groups[corruption_types[i]]["refs"].append(refs[i])
-
-    for ct in sorted(ct_groups):
-        g = ct_groups[ct]
-        em = sum(exact_match(p, r) for p, r in zip(g["preds"], g["refs"])) / len(g["preds"])
-        ch = chrf_score(g["preds"], g["refs"]).score
-        print(f"  {ct:<16}: EM={em:.4f} ({em*100:.1f}%)  chrF={ch:.2f}  n={len(g['preds'])}")
-
-    # Per-source breakdown
-    print()
+    # Per-source breakdown (not in shared report, so do manually)
     print("-" * 60)
     print("PER SOURCE")
     print("-" * 60)
+    from collections import defaultdict
     src_groups = defaultdict(lambda: {"preds": [], "refs": []})
     for i in range(len(preds)):
         src_groups[sources[i]]["preds"].append(preds[i])
         src_groups[sources[i]]["refs"].append(refs[i])
-
     for src in sorted(src_groups):
         g = src_groups[src]
         em = sum(exact_match(p, r) for p, r in zip(g["preds"], g["refs"])) / len(g["preds"])
-        ch = chrf_score(g["preds"], g["refs"]).score
-        print(f"  {src:<12}: EM={em:.4f} ({em*100:.1f}%)  chrF={ch:.2f}  n={len(g['preds'])}")
+        print(f"  {src:<12}: EM={em:.4f}  n={len(g['preds'])}")
 
-    # Show some failures
+    # Show sample failures
     print()
     print("-" * 60)
     print("SAMPLE FAILURES (first 5)")

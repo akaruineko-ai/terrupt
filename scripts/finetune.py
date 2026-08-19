@@ -3,22 +3,24 @@
 Loads the paired dataset from local disk or HuggingFace Hub, builds a
 hard-weighted subsample (or uses all 29M rows), tokenizes, and trains
 with the HuggingFace Seq2SeqTrainer. Supports LoRA, HF bucket sync,
-and configurable checkpoint frequency with storage-limit pruning.
+configurable checkpoint frequency with storage-limit pruning, and
+per-severity generation quality evaluation.
 
 Usage:
-    # Local 1660 Ti (5M hard-weighted, ~5-20h)
+    # Local 1660 Ti (5M hard-weighted)
     python scripts/finetune.py --data data/terrupt-textcorrupt
 
-    # Full 29M on A100 (1 epoch, ~1.5h), save every 5k steps
+    # Full 29M on A100 (1 epoch), save every 5k steps
     python scripts/finetune.py --data akaruineko/terrupt-textcorrupt \
         --target-rows -1 --epochs 1 --precision bf16 \
         --save-steps 5000
 
-    # Colab with HF bucket sync + 50GB local+remote checkpoint cap
+    # Colab with bucket sync + 50GB checkpoint cap + end-of-training gen eval
     python scripts/finetune.py --data akaruineko/terrupt-textcorrupt \
         --target-rows -1 --precision bf16 \
         --hf-bucket hf://buckets/akaruineko/restratext \
-        --limit-checkpoints-folder 50gb
+        --limit-checkpoints-folder 50gb \
+        --full-eval-at-end
 
     # LoRA on T5-large with 20GB checkpoint cap
     python scripts/finetune.py --model t5-large --lora --lora-r 16 \
@@ -40,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 from datasets import load_from_disk, load_dataset
+from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -48,6 +51,8 @@ from transformers import (
     Seq2SeqTrainingArguments,
     TrainerCallback,
 )
+
+from terrupt.metrics import build_quality_report, print_quality_report, quality_report_to_log
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +117,7 @@ def checkpoint_dirs(output_dir):
 # ---------------------------------------------------------------------------
 
 def sync_to_hf_bucket(local_dir, bucket_url, delete_remote=False):
-    """Sync a local directory to an HF bucket via ``hf sync``.
-
-    When *delete_remote* is True, passes ``--delete`` so the bucket
-    mirrors exactly what's in *local_dir* (pruned checkpoints removed).
-    """
+    """Sync a local directory to an HF bucket via ``hf sync``."""
     cmd = ["hf", "sync"]
     if delete_remote:
         cmd.append("--delete")
@@ -147,12 +148,7 @@ class HFSyncCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 
 class StorageLimitCallback(TrainerCallback):
-    """Delete oldest checkpoint-* dirs when output_dir exceeds a byte-size cap.
-
-    Always protects:
-      - The just-saved checkpoint (``checkpoint-{state.global_step}``)
-      - The best checkpoint (``state.best_model_checkpoint``)
-    """
+    """Delete oldest checkpoint-* dirs when output_dir exceeds a byte-size cap."""
 
     def __init__(self, output_dir, limit_bytes):
         self.output_dir = output_dir
@@ -160,13 +156,10 @@ class StorageLimitCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         limit = self.limit_bytes
-
-        # Determine protected checkpoints (never delete these)
         protected = set()
         if state.best_model_checkpoint:
             protected.add(os.path.basename(state.best_model_checkpoint))
-        latest = f"checkpoint-{state.global_step}"
-        protected.add(latest)
+        protected.add(f"checkpoint-{state.global_step}")
 
         total = dir_size(self.output_dir)
         if total <= limit:
@@ -190,8 +183,101 @@ class StorageLimitCallback(TrainerCallback):
             total -= freed
             print(f"  [storage-limit] deleted {oldest} (freed {freed / (1 << 30):.1f} GB, "
                   f"now {total / (1 << 30):.1f} GB)")
-
         print()
+
+
+# ---------------------------------------------------------------------------
+# Quality-eval callback (generation-based per-severity metrics)
+# ---------------------------------------------------------------------------
+
+class QualityEvalCallback(TrainerCallback):
+    """Run generation-based quality eval on a fixed stratified subset each epoch.
+
+    Produces per-severity exact-match + chrF tables printed to stdout and
+    logged to the Trainer metric history.
+
+    Optionally runs a final full-val generation pass after training.
+    """
+
+    def __init__(self, trainer, tokenizer, quality_subset, severity_list,
+                 eval_num_beams=4, eval_batch_size=32, eval_max_length=64,
+                 eval_every=1, full_eval_at_end=False, full_val_ds=None,
+                 full_val_severities=None, full_val_refs=None):
+        self.trainer = trainer
+        self.tokenizer = tokenizer
+        self.quality_subset = quality_subset
+        self.severity_list = severity_list
+        self.eval_num_beams = eval_num_beams
+        self.eval_batch_size = eval_batch_size
+        self.eval_max_length = eval_max_length
+        self.eval_every = eval_every
+        self.full_eval_at_end = full_eval_at_end
+        self.full_val_ds = full_val_ds
+        self.full_val_severities = full_val_severities
+        self.full_val_refs = full_val_refs
+
+    def _run_generation_eval(self, dataset, severity_list, refs, label):
+        """Run generate() over a dataset, return quality report dict."""
+        self.trainer.model.eval()
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.eval_batch_size,
+            collate_fn=self.trainer.data_collator,
+            shuffle=False,
+            num_workers=2,
+        )
+        all_preds = []
+        all_refs = []
+        all_sevs = []
+        idx = 0
+        for batch in dataloader:
+            # Move to device
+            batch = {k: v.to(self.trainer.args.device) for k, v in batch.items() if k != "severity"}
+            labels = batch.pop("labels", None)
+            with torch.no_grad():
+                generated = self.trainer.model.generate(
+                    **batch,
+                    max_length=self.eval_max_length,
+                    num_beams=self.eval_num_beams,
+                    early_stopping=True,
+                )
+            decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+            n = len(decoded)
+            all_preds.extend(decoded)
+            all_refs.extend(refs[idx:idx + n])
+            all_sevs.extend(severity_list[idx:idx + n])
+            idx += n
+
+        report = build_quality_report(all_preds, all_refs, severities=all_sevs)
+        print_quality_report(report, title=label)
+        return report
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        epoch = int(state.epoch)
+        if epoch % self.eval_every != 0:
+            return
+        print(f"\n  [quality] generation eval (epoch {epoch})...")
+        report = self._run_generation_eval(
+            self.quality_subset, self.severity_list,
+            [self.quality_subset[i]["original"] for i in range(len(self.quality_subset))],
+            label=f"quality eval (epoch {epoch})",
+        )
+        # Log metrics
+        log_metrics = quality_report_to_log(report, prefix="quality")
+        log_metrics["epoch"] = state.epoch
+        self.trainer.log(log_metrics)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if not self.full_eval_at_end or self.full_val_ds is None:
+            return
+        print("\n  [quality] full-val generation eval (end of training)...")
+        report = self._run_generation_eval(
+            self.full_val_ds, self.full_val_severities, self.full_val_refs,
+            label="full-val quality (end of training)",
+        )
+        log_metrics = quality_report_to_log(report, prefix="full_quality")
+        log_metrics["epoch"] = state.epoch
+        self.trainer.log(log_metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +302,8 @@ def load_data(data_path):
     """Load dataset from local path or HuggingFace Hub repo ID."""
     if os.path.isdir(data_path):
         return load_from_disk(data_path)
-    # Assume HF Hub repo ID (e.g. "akaruineko/terrupt-textcorrupt")
     print(f"Loading dataset from HuggingFace Hub: {data_path}")
     ds = load_dataset(data_path)
-    # Normalize: HF datasets may return train-only if no split info
     if "train" not in ds:
         key = list(ds.keys())[0]
         ds = ds.rename_column(key, "train") if key != "train" else ds
@@ -231,26 +315,18 @@ def load_data(data_path):
 # ---------------------------------------------------------------------------
 
 def build_subsample(dataset, target_n=5_000_000, seed=42):
-    """Build a hard-weighted subsample: keep severity 1.0 heavily, thin out 0.1/0.25.
-
-    Returns list of indices, or None if target_n < 0 (= use all rows).
-    """
+    """Build a hard-weighted subsample: keep severity 1.0 heavily, thin out 0.1/0.25."""
     if target_n < 0:
         print(f"Using full dataset: {len(dataset)} rows")
         return None
 
     rng = random.Random(seed)
     total = len(dataset)
-
-    # Extract severities in bulk (fast column access)
     severities = dataset["severity"]
-
-    # Bucket indices by severity
     buckets = {0.1: [], 0.25: [], 0.5: [], 0.75: [], 1.0: []}
     for i, sev in enumerate(severities):
         buckets[sev].append(i)
 
-    # Target 5M: 3M from severity 1.0, 1.5M from 0.75, 500k from 0.5
     plan = {
         1.0: min(len(buckets[1.0]), 3_000_000),
         0.75: min(len(buckets[0.75]), 1_500_000),
@@ -273,6 +349,49 @@ def build_subsample(dataset, target_n=5_000_000, seed=42):
         actual = sum(1 for i in selected if severities[i] == sev)
         print(f"  severity {sev}: {actual}")
     return selected
+
+
+def build_quality_subset(val_full, tokenizer, per_severity_n=1000, seed=42,
+                         max_length=64, n_proc=1, cache_prefix=None):
+    """Build a fixed stratified subset for generation-based quality eval.
+
+    Returns (tokenized_dataset, severity_list) where severity_list is aligned
+    by row index.
+    """
+    rng = random.Random(seed)
+    buckets = {0.1: [], 0.25: [], 0.5: [], 0.75: [], 1.0: []}
+    val_severities = val_full["severity"]
+    for i, sev in enumerate(val_severities):
+        buckets[sev].append(i)
+
+    selected = []
+    for sev, pool in sorted(buckets.items()):
+        n = min(per_severity_n, len(pool))
+        selected.extend(rng.sample(pool, n) if n < len(pool) else pool)
+    rng.shuffle(selected)
+
+    subset = val_full.select(selected)
+    severity_list = [val_severities[i] for i in selected]
+
+    # Tokenize
+    def preprocess(examples):
+        inputs = ["restore: " + c for c in examples["corrupted"]]
+        targets = examples["original"]
+        model_inputs = tokenizer(inputs, max_length=max_length, truncation=True, padding=False)
+        labels = tokenizer(targets, max_length=max_length, truncation=True, padding=False)
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    cache_files = None
+    if cache_prefix:
+        cache_files = [f"{cache_prefix}_quality{i}" for i in range(n_proc)]
+
+    subset = subset.map(
+        preprocess, batched=True, batch_size=512, num_proc=n_proc,
+        cache_file_names={f"proc{i}": cf for i, cf in enumerate(cache_files)} if cache_files else None,
+    )
+    print(f"Quality subset: {len(subset)} rows (per-sev: {per_severity_n})")
+    return subset, severity_list
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +447,8 @@ def main():
                         help="HuggingFace model ID or local path")
     parser.add_argument("--target-rows", type=int, default=5_000_000,
                         help="Number of train rows (-1 = use all 29M)")
-    parser.add_argument("--val-rows", type=int, default=20_000,
-                        help="Number of val rows for eval")
+    parser.add_argument("--val-rows", type=int, default=None,
+                        help="Number of val rows for loss eval (default: full val)")
     parser.add_argument("--max-length", type=int, default=64,
                         help="Max token length for inputs and labels")
     parser.add_argument("--num-proc", type=int, default=1,
@@ -348,9 +467,19 @@ def main():
     parser.add_argument("--save-steps", type=int, default=None,
                         help="Save checkpoint every N steps (default: save per epoch)")
     parser.add_argument("--limit-checkpoints-folder", type=str, default=None,
-                        help="Max local+remote checkpoint storage (e.g. '50gb', '200mb'). "
-                             "Oldest checkpoints are deleted when exceeded. Also enforced "
-                             "on HF bucket when --hf-bucket is set.")
+                        help="Max local+remote checkpoint storage (e.g. '50gb', '200mb')")
+
+    # Quality evaluation
+    parser.add_argument("--eval-subset", type=int, default=1000,
+                        help="Rows per severity for the generation quality eval subset (default: 1000)")
+    parser.add_argument("--quality-eval-every", type=int, default=1,
+                        help="Run generation quality eval every N epochs (default: 1)")
+    parser.add_argument("--eval-num-beams", type=int, default=4,
+                        help="Beams for generation quality eval (1=greedy, default: 4)")
+    parser.add_argument("--eval-batch-size", type=int, default=32,
+                        help="Batch size for generation quality eval (default: 32)")
+    parser.add_argument("--full-eval-at-end", action="store_true",
+                        help="Run full-val generation eval after training completes")
 
     # LoRA
     parser.add_argument("--lora", action="store_true",
@@ -385,7 +514,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model)
 
-    # LoRA
     if args.lora:
         from peft import LoraConfig, get_peft_model, TaskType
         print(f"Applying LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
@@ -413,17 +541,17 @@ def main():
     # Subsample train
     print("Building training split...")
     train_idx = build_subsample(train_full, args.target_rows, args.seed)
-    if train_idx is not None:
-        train_ds = train_full.select(train_idx)
+    train_ds = train_full.select(train_idx) if train_idx is not None else train_full
+
+    # Val subset for loss eval (full or partial)
+    if args.val_rows is not None and args.val_rows < len(val_full):
+        val_rng = random.Random(args.seed)
+        val_idx = val_rng.sample(range(len(val_full)), args.val_rows)
+        val_ds = val_full.select(val_idx)
     else:
-        train_ds = train_full
+        val_ds = val_full
 
-    # Val subset
-    val_rng = random.Random(args.seed)
-    val_idx = val_rng.sample(range(len(val_full)), min(args.val_rows, len(val_full)))
-    val_ds = val_full.select(val_idx)
-
-    # Tokenize (cached by default)
+    # Tokenize train + val for loss eval
     n_proc = args.num_proc if args.num_proc > 0 else (os.cpu_count() or 1)
     cache_prefix = args.tokenize_cache_dir
     print(f"Tokenizing train ({len(train_ds)}) and val ({len(val_ds)}) [workers={n_proc}]...")
@@ -438,6 +566,15 @@ def main():
         force_retokenize=args.force_retokenize,
     )
 
+    # Build quality subset (stratified by severity, for generation eval)
+    quality_sub_sevs = None
+    quality_ds, quality_sevs = build_quality_subset(
+        val_full, tokenizer,
+        per_severity_n=args.eval_subset, seed=args.seed,
+        max_length=args.max_length, n_proc=n_proc,
+        cache_prefix=cache_prefix,
+    )
+
     # -----------------------------------------------------------------------
     # Training args
     # -----------------------------------------------------------------------
@@ -445,21 +582,13 @@ def main():
     effective_batch = args.batch_size * args.grad_accum
     precision = resolve_precision(args.precision)
 
-    # Checkpoint strategy: steps vs epoch
     if args.save_steps is not None:
-        save_strategy = "steps"
-        save_steps = args.save_steps
+        save_strategy, save_steps = "steps", args.save_steps
     else:
-        save_strategy = "epoch"
-        save_steps = None
+        save_strategy, save_steps = "epoch", None
 
-    # When a storage limit is set, disable Trainer's count-based pruning
-    # so our size-based callback governs exclusively.
     has_storage_limit = args.limit_checkpoints_folder is not None
-    if has_storage_limit:
-        storage_limit_bytes = parse_size(args.limit_checkpoints_folder)
-    else:
-        storage_limit_bytes = None
+    storage_limit_bytes = parse_size(args.limit_checkpoints_folder) if has_storage_limit else None
 
     training_kwargs = dict(
         output_dir=args.out,
@@ -499,41 +628,52 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # Callbacks: storage limit + HF bucket sync
+    # Callbacks
     # -----------------------------------------------------------------------
-    # Storage limit callback (runs first — prunes oldest local checkpoints)
     if has_storage_limit:
-        print(f"Storage limit: {args.limit_checkpoints_folder} "
-              f"({storage_limit_bytes:,} bytes)")
-        trainer.add_callback(
-            StorageLimitCallback(args.out, storage_limit_bytes)
-        )
+        print(f"Storage limit: {args.limit_checkpoints_folder} ({storage_limit_bytes:,} bytes)")
+        trainer.add_callback(StorageLimitCallback(args.out, storage_limit_bytes))
 
-    # HF bucket sync (runs after pruning — with --delete to mirror local state)
     if args.hf_bucket:
         print(f"Checkpoint sync: {args.hf_bucket}")
-        trainer.add_callback(
-            HFSyncCallback(args.hf_bucket, args.out, delete_remote=has_storage_limit)
-        )
+        trainer.add_callback(HFSyncCallback(args.hf_bucket, args.out, delete_remote=has_storage_limit))
+
+    # Quality eval callback (generation-based per-severity metrics)
+    quality_callback = QualityEvalCallback(
+        trainer=trainer,
+        tokenizer=tokenizer,
+        quality_subset=quality_ds,
+        severity_list=quality_sevs,
+        eval_num_beams=args.eval_num_beams,
+        eval_batch_size=args.eval_batch_size,
+        eval_max_length=args.max_length,
+        eval_every=args.quality_eval_every,
+        full_eval_at_end=args.full_eval_at_end,
+    )
+    trainer.add_callback(quality_callback)
 
     # -----------------------------------------------------------------------
     # Train
     # -----------------------------------------------------------------------
     print("\nStarting training...")
-    print(f"  Model:          {args.model}")
-    print(f"  Train rows:     {len(train_ds)}")
-    print(f"  Val rows:       {len(val_ds)}")
-    print(f"  Epochs:         {args.epochs}")
-    print(f"  Effective batch:{effective_batch}")
-    print(f"  LR:             {args.lr}")
-    print(f"  Precision:      {precision}")
-    print(f"  Save strategy:  {save_strategy}"
+    print(f"  Model:            {args.model}")
+    print(f"  Train rows:       {len(train_ds)}")
+    print(f"  Val rows (loss):  {len(val_ds)}")
+    print(f"  Quality subset:   {len(quality_ds)} ({args.eval_subset}/severity)")
+    print(f"  Epochs:           {args.epochs}")
+    print(f"  Effective batch:  {effective_batch}")
+    print(f"  LR:               {args.lr}")
+    print(f"  Precision:        {precision}")
+    print(f"  Save strategy:    {save_strategy}"
           + (f" every {save_steps} steps" if save_steps else ""))
-    print(f"  Storage limit:  {args.limit_checkpoints_folder or 'none'}")
-    print(f"  LoRA:           {'yes' if args.lora else 'no'}")
-    print(f"  Output:         {args.out}")
+    print(f"  Storage limit:    {args.limit_checkpoints_folder or 'none'}")
+    print(f"  Quality eval:     every {args.quality_eval_every} epoch(s), "
+          f"beams={args.eval_num_beams}")
+    print(f"  Full eval at end: {'yes' if args.full_eval_at_end else 'no'}")
+    print(f"  LoRA:             {'yes' if args.lora else 'no'}")
+    print(f"  Output:           {args.out}")
     if args.hf_bucket:
-        print(f"  HF bucket:      {args.hf_bucket}")
+        print(f"  HF bucket:        {args.hf_bucket}")
     print()
 
     t0 = time.time()
@@ -547,7 +687,7 @@ def main():
     # -----------------------------------------------------------------------
     # Save + sync
     # -----------------------------------------------------------------------
-    print(f"\nTraining complete in {elapsed/60:.1f} min")
+    print(f"\nTraining complete in {elapsed / 60:.1f} min")
     print(f"Saving final model to {args.out}...")
     trainer.save_model(args.out)
     tokenizer.save_pretrained(args.out)
